@@ -1853,6 +1853,8 @@ class TranscriptionRequest(OpenAIBaseModel):
                                             output_kind=RequestOutputKind.DELTA
                                             if self.stream \
                                             else RequestOutputKind.FINAL_ONLY,
+                                            response_format=self.response_format,
+                                            timestamp_granularities=self.timestamp_granularities,
                                             extra_args=self.vllm_xargs)
 
     @model_validator(mode="before")
@@ -1869,6 +1871,24 @@ class TranscriptionRequest(OpenAIBaseModel):
         if any(bool(data.get(so, False)) for so in stream_opts) and not stream:
             raise ValueError(
                 "Stream options can only be defined when `stream=True`.")
+
+        # Validate timestamp_granularities
+        timestamp_granularities = data.get("timestamp_granularities", [])
+        response_format = data.get("response_format", "json")
+        
+        if timestamp_granularities:
+            # Validate that response_format is verbose_json when timestamp_granularities is set
+            if response_format != "verbose_json":
+                raise ValueError(
+                    "timestamp_granularities can only be used when response_format is 'verbose_json'")
+            
+            # Validate granularity values
+            valid_granularities = {"word", "segment"}
+            for granularity in timestamp_granularities:
+                if granularity not in valid_granularities:
+                    raise ValueError(
+                        f"Invalid timestamp granularity '{granularity}'. "
+                        f"Must be one of: {sorted(valid_granularities)}")
 
         return data
 

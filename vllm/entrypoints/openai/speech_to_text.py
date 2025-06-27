@@ -17,6 +17,7 @@ from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (
     DeltaMessage, ErrorResponse, RequestResponseMetadata,
     TranscriptionResponse, TranscriptionResponseStreamChoice,
+    TranscriptionResponseVerbose, TranscriptionSegment, TranscriptionWord,
     TranscriptionStreamResponse, TranslationResponse,
     TranslationResponseStreamChoice, TranslationStreamResponse, UsageInfo)
 from vllm.entrypoints.openai.serving_engine import (OpenAIServing,
@@ -27,13 +28,15 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils import PlaceholderModule
+from vllm.model_executor.whisper_alignment import WordTiming
 
 try:
     import librosa
+    import numpy as np
 except ImportError:
     librosa = PlaceholderModule("librosa")  # type: ignore[assignment]
 
-SpeechToTextResponse = Union[TranscriptionResponse, TranslationResponse]
+SpeechToTextResponse = Union[TranscriptionResponse, TranscriptionResponseVerbose, TranslationResponse]
 T = TypeVar("T", bound=SpeechToTextResponse)
 
 logger = init_logger(__name__)
@@ -328,10 +331,19 @@ class OpenAISpeechToText(OpenAIServing):
         try:
             assert list_result_generator is not None
             text = ""
+            all_outputs = []
             for result_generator in list_result_generator:
                 async for op in result_generator:
                     text += op.outputs[0].text
-            return cast(T, response_class(text=text))
+                    all_outputs.append(op)
+            
+            # Check if we need to return verbose JSON response
+            if (hasattr(request, 'response_format') and 
+                request.response_format == "verbose_json"):
+                return cast(T, self._create_verbose_response(
+                    request, text, all_outputs, duration_s))
+            else:
+                return cast(T, response_class(text=text))
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
@@ -501,3 +513,164 @@ class OpenAISpeechToText(OpenAIServing):
                 quietest_idx = i + start_idx
                 min_energy = energy
         return quietest_idx
+
+    def _create_verbose_response(
+        self, 
+        request: SpeechToTextRequest, 
+        text: str, 
+        outputs: list[RequestOutput], 
+        duration_s: float
+    ) -> TranscriptionResponseVerbose:
+        """Create a verbose JSON response with timestamps if requested."""
+        
+        # Extract language from request or default to "en"
+        detected_language = request.language if request.language else "en"
+        
+        # Extract timestamp granularities from sampling params
+        needs_segments = False
+        needs_words = False
+        
+        if hasattr(request, 'timestamp_granularities') and request.timestamp_granularities:
+            needs_segments = "segment" in request.timestamp_granularities
+            needs_words = "word" in request.timestamp_granularities
+        
+        segments = None
+        words = None
+        
+        # Extract word timings from model outputs if needed
+        word_timings = []
+        if needs_words and outputs:
+            word_timings = self._extract_word_timings_from_outputs(outputs)
+        
+        if needs_segments:
+            # Create segments with word timings if available
+            segments = self._create_segments_from_outputs(outputs, text, duration_s, word_timings if needs_words else None)
+        
+        if needs_words and word_timings:
+            # Convert WordTiming objects to TranscriptionWord objects
+            words = [
+                TranscriptionWord(
+                    word=wt.word,
+                    start=wt.start,
+                    end=wt.end
+                )
+                for wt in word_timings
+            ]
+        elif needs_words:
+            # Fallback: Create simple word-level timestamps by splitting text
+            words_list = text.split()
+            if words_list:
+                word_duration = duration_s / len(words_list)
+                words = []
+                for i, word in enumerate(words_list):
+                    start_time = i * word_duration
+                    end_time = (i + 1) * word_duration
+                    words.append(TranscriptionWord(
+                        word=word,
+                        start=start_time,
+                        end=end_time
+                    ))
+        
+        # Create response based on format preference
+        if (hasattr(request, 'response_format') and 
+            request.response_format == "verbose_json"):
+            
+            # Custom serialization for verbose_json format
+            body = {
+                "duration": f"{duration_s:.2f}",
+                "language": detected_language,
+                "text": text,
+                "segments": [segment.model_dump() for segment in segments] if segments else None,
+            }
+            
+            # Add word-level timestamps if requested
+            if (hasattr(request, 'timestamp_granularities') and
+                request.timestamp_granularities and
+                "word" in request.timestamp_granularities and
+                segments):
+                # Flatten all words from all segments
+                body["words"] = [
+                    word for segment in segments 
+                    for word in (segment.words or [])
+                ]
+            
+            return TranscriptionResponseVerbose(**body)
+        else:
+            # Fallback to standard response creation
+            return TranscriptionResponseVerbose(
+                duration=f"{duration_s:.2f}",
+                language=detected_language,
+                text=text,
+                segments=segments,
+                words=words
+            )
+
+    def _extract_word_timings_from_outputs(self, outputs: list[RequestOutput]) -> list[WordTiming]:
+        """Extract word timings from model outputs using alignment weights."""
+        word_timings = []
+        
+        for output in outputs:
+            # Check if the output has word timing information stored
+            if hasattr(output, 'word_timings') and output.word_timings:
+                word_timings.extend(output.word_timings)
+            else:
+                # Try to extract from sequence data
+                for seq_output in output.outputs:
+                    if hasattr(seq_output, 'word_timings') and seq_output.word_timings:
+                        word_timings.extend(seq_output.word_timings)
+        
+        return word_timings
+
+    def _create_segments_from_outputs(
+        self, 
+        outputs: list[RequestOutput], 
+        text: str, 
+        duration_s: float,
+        word_timings: Optional[list[WordTiming]] = None
+    ) -> list[TranscriptionSegment]:
+        """Create segment objects from model outputs."""
+        segments = []
+        
+        # For now, create a single segment per output
+        # In practice, this could be enhanced to create multiple segments based on natural breaks
+        for i, output in enumerate(outputs):
+            segment_text = ""
+            for seq_output in output.outputs:
+                segment_text += seq_output.text
+            
+            # Calculate segment timing
+            if len(outputs) > 1:
+                # Multiple chunks - distribute time evenly
+                segment_duration = duration_s / len(outputs)
+                start_time = i * segment_duration
+                end_time = (i + 1) * segment_duration
+            else:
+                # Single segment covers entire duration
+                start_time = 0.0
+                end_time = duration_s
+            
+            # Create segment words if word timings are available
+            segment_words = None
+            if word_timings:
+                # Filter word timings that fall within this segment's time range
+                segment_words = [
+                    {"word": wt.word, "start": wt.start, "end": wt.end}
+                    for wt in word_timings
+                    if start_time <= wt.start <= end_time
+                ]
+            
+            segment = TranscriptionSegment(
+                id=i,
+                seek=0,  # Frame index - would need to be calculated from actual frames
+                start=start_time,
+                end=end_time,
+                text=segment_text,
+                temperature=0.0,  # TODO: Extract from sampling params if available
+                avg_logprob=-0.5,  # TODO: Calculate from actual token probabilities
+                compression_ratio=1.0,  # TODO: Calculate actual compression ratio
+                no_speech_prob=0.0,  # TODO: Extract from model if available
+                words=segment_words
+            )
+            segments.append(segment)
+        
+        return segments

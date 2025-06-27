@@ -248,6 +248,10 @@ class SamplingParams(
     bad_words: Optional[list[str]] = None
     _bad_words_token_ids: Optional[list[list[int]]] = None
 
+    # Fields for OpenAI Whisper timestamp granularities
+    response_format: str = "json"
+    timestamp_granularities: Optional[list[str]] = None
+
     @staticmethod
     def from_optional(
         n: Optional[int] = 1,
@@ -280,6 +284,8 @@ class SamplingParams(
         logit_bias: Optional[Union[dict[int, float], dict[str, float]]] = None,
         allowed_token_ids: Optional[list[int]] = None,
         extra_args: Optional[dict[str, Any]] = None,
+        response_format: str = "json",
+        timestamp_granularities: Optional[list[str]] = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -322,6 +328,8 @@ class SamplingParams(
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
+            response_format=response_format,
+            timestamp_granularities=timestamp_granularities,
         )
 
     def __post_init__(self) -> None:
@@ -585,6 +593,8 @@ class SamplingParams(
             f"{self.spaces_between_special_tokens}, "
             f"truncate_prompt_tokens={self.truncate_prompt_tokens}, "
             f"guided_decoding={self.guided_decoding}, "
+            f"response_format={self.response_format}, "
+            f"timestamp_granularities={self.timestamp_granularities}, "
             f"extra_args={self.extra_args})")
 
 

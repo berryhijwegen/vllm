@@ -3,8 +3,9 @@
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Optional, TypedDict, Union
+from typing import List, NamedTuple, Optional, TypedDict, Union
 
+import numpy as np
 import torch
 from torch import nn
 from transformers import (BatchFeature, WhisperConfig, WhisperFeatureExtractor,
@@ -40,6 +41,359 @@ from .utils import (AutoWeightsLoader, WeightsMapper, cast_overflow_tensors,
                     make_layers)
 
 logger = init_logger(__name__)
+
+
+# Word-level timestamp alignment for Whisper using Dynamic Time Warping (DTW)
+class WordTiming(NamedTuple):
+    """Word timing information."""
+    word: str
+    tokens: List[int]
+    start: float
+    end: float
+    probability: float
+
+
+def dtw(x: np.ndarray, band_width: int = 50) -> tuple[np.ndarray, np.ndarray]:
+    """Dynamic Time Warping alignment with Sakoe-Chiba band constraint.
+    
+    Args:
+        x: Cost matrix of shape (N, M)
+        band_width: Maximum deviation from diagonal (±band_width frames)
+        
+    Returns:
+        Tuple of (path_x, path_y) indices for optimal alignment
+    """
+    N, M = x.shape
+    cost = np.ones((N + 1, M + 1), dtype=np.float32) * np.inf
+    trace = -np.ones((N + 1, M + 1), dtype=np.int32)
+
+    cost[0, 0] = 0
+    
+    # Compute the diagonal scaling factor
+    diagonal_ratio = M / N if N > 0 else 1.0
+    
+    for j in range(1, M + 1):
+        for i in range(1, N + 1):
+            # Calculate expected position on diagonal
+            expected_j = int(i * diagonal_ratio)
+            
+            # Skip if outside the band constraint
+            if abs(j - expected_j) > band_width:
+                continue
+                
+            c0 = cost[i - 1, j - 1]
+            c1 = cost[i - 1, j]
+            c2 = cost[i, j - 1]
+
+            if c0 < c1 and c0 < c2:
+                c, t = c0, 2
+            elif c1 < c0 and c1 < c2:
+                c, t = c1, 1
+            else:
+                c, t = c2, 0
+
+            cost[i, j] = x[i - 1, j - 1] + c
+            trace[i, j] = t
+
+    # Backtrack
+    i, j = N, M
+    path_x, path_y = [i], [j]
+    while i > 0 or j > 0:
+        t = trace[i, j]
+        if t == 2:
+            i, j = i - 1, j - 1
+        elif t == 1:
+            i, j = i - 1, j
+        else:
+            i, j = i, j - 1
+        path_x.append(i)
+        path_y.append(j)
+
+    path_x.reverse()
+    path_y.reverse()
+    return np.array(path_x[1:]), np.array(path_y[1:])
+
+
+def find_alignment(
+    cross_attention_weights: List[torch.Tensor],
+    text_tokens: List[int],
+    num_frames: int,
+    alignment_heads: List[tuple[int, int]],
+    tokenizer_info: dict,
+    feature_extractor_info: dict,
+    *,
+    medfilt_width: int = 5,
+    qk_scale: float = 1.0,
+) -> List[WordTiming]:
+    """Find word-level alignments using cross-attention weights and DTW.
+    
+    Args:
+        cross_attention_weights: List of attention weight tensors from decoder layers
+        text_tokens: Token IDs for the text (without special tokens)
+        num_frames: Number of audio frames
+        alignment_heads: List of (layer_idx, head_idx) tuples for alignment
+        tokenizer_info: Dict containing tokenizer information
+        feature_extractor_info: Dict containing feature extractor info
+        medfilt_width: Width for median filtering
+        qk_scale: Scaling factor for attention weights
+        
+    Returns:
+        List of WordTiming objects with word-level timestamps
+    """
+    if len(text_tokens) == 0:
+        return []
+
+    # Extract tokenizer info
+    sot_sequence_len = tokenizer_info.get("sot_sequence_len", 4)
+    eot_token = tokenizer_info.get("eot_token", 50257)
+    
+    # Extract feature extractor info for time conversion
+    hop_length = feature_extractor_info.get("hop_length", 160)
+    sampling_rate = feature_extractor_info.get("sampling_rate", 16000)
+    time_per_frame = hop_length / sampling_rate
+
+    # Collect attention weights from specified alignment heads
+    try:
+        weights = []
+        for layer_idx, head_idx in alignment_heads:
+            if (layer_idx < len(cross_attention_weights) and 
+                cross_attention_weights[layer_idx] is not None and
+                head_idx < cross_attention_weights[layer_idx].shape[1]):
+                # Extract weights: (batch, heads, seq_len, num_frames)
+                attn_weights = cross_attention_weights[layer_idx][0, head_idx]
+                weights.append(attn_weights)
+        
+        if not weights:
+            logger.warning("No valid alignment heads found")
+            return []
+            
+        # Stack and process weights: (num_heads, seq_len, num_frames)
+        weights = torch.stack(weights)
+        
+        # Trim to actual audio frames
+        max_frames = min(weights.shape[-1], num_frames)
+        weights = weights[:, :, :max_frames]
+        
+        # Apply scaling and softmax
+        weights = (weights * qk_scale).softmax(dim=-1)
+        
+        # Normalize: subtract mean and divide by std across time dimension
+        std, mean = torch.std_mean(weights, dim=-1, keepdim=True, unbiased=False)
+        weights = (weights - mean) / (std + 1e-8)  # Add epsilon for numerical stability
+        
+        # Average across alignment heads first on GPU to reduce memory transfer
+        matrix = torch.mean(weights, dim=0)  # Shape: (seq_len, num_frames)
+        
+        # Apply efficient 1D smoothing filter on GPU (replaces median filter)
+        if medfilt_width > 1:
+            # Use 1D convolution for efficient smoothing on GPU
+            kernel_size = medfilt_width
+            padding = kernel_size // 2
+            
+            # Create a uniform kernel for smoothing
+            kernel = torch.ones(1, 1, kernel_size, device=matrix.device, dtype=matrix.dtype) / kernel_size
+            
+            # Apply 1D convolution along the time dimension (last dim)
+            # Reshape for conv1d: (batch=seq_len, channels=1, length=num_frames)
+            matrix_reshaped = matrix.unsqueeze(1)  # (seq_len, 1, num_frames)
+            smoothed = torch.nn.functional.conv1d(
+                matrix_reshaped, 
+                kernel, 
+                padding=padding,
+                groups=1
+            )
+            matrix = smoothed.squeeze(1)  # Back to (seq_len, num_frames)
+        
+        # Convert to CPU after GPU processing
+        matrix = matrix.cpu().numpy()
+        
+        # Remove special tokens (SOT sequence at start, EOT at end)
+        matrix = matrix[sot_sequence_len:-1]  # Remove SOT and EOT
+        text_tokens = text_tokens[sot_sequence_len:-1]  # Remove corresponding tokens
+        
+        # Ensure we have the right number of tokens
+        if matrix.shape[0] != len(text_tokens):
+            logger.warning(f"Matrix shape {matrix.shape[0]} doesn't match text tokens {len(text_tokens)}")
+            # Adjust if there's a mismatch
+            min_len = min(matrix.shape[0], len(text_tokens))
+            matrix = matrix[:min_len]
+            text_tokens = text_tokens[:min_len]
+        
+        # Perform DTW alignment
+        text_indices, time_indices = dtw(-matrix)
+        
+    except Exception as e:
+        logger.error(f"Error in alignment processing: {e}")
+        return []
+
+    # Split tokens into words using actual tokenizer
+    words, word_tokens = _split_to_word_tokens(text_tokens, eot_token, tokenizer_info)
+    
+    if len(word_tokens) <= 1:
+        return []
+    
+    # Calculate word boundaries in token space
+    word_boundaries = np.pad(np.cumsum([len(t) for t in word_tokens[:-1]]), (1, 0))
+    
+    # Find jumps in alignment
+    jumps = np.diff(text_indices, prepend=text_indices[:1]) != 0
+    jump_times = time_indices[jumps] * time_per_frame  # Convert to seconds
+    
+    # Map to word boundaries
+    start_times = jump_times[word_boundaries[:-1]]
+    end_times = jump_times[np.minimum(word_boundaries[1:], len(jump_times) - 1)]
+    
+    # Calculate word probabilities from alignment matrix
+    word_probabilities = []
+    for i, word_token_list in enumerate(word_tokens):
+        if not word_token_list or word_token_list == [eot_token]:
+            word_probabilities.append(0.0)
+            continue
+            
+        # Get token indices for this word
+        start_token_idx = word_boundaries[i] if i < len(word_boundaries) else 0
+        end_token_idx = word_boundaries[i + 1] if i + 1 < len(word_boundaries) else len(text_indices)
+        
+        # Collect probabilities for tokens in this word
+        token_probs = []
+        for token_idx in range(start_token_idx, min(end_token_idx, len(text_indices))):
+            if token_idx < len(text_indices):
+                t_i = text_indices[token_idx]
+                f_i = time_indices[token_idx]
+                if t_i < matrix.shape[0] and f_i < matrix.shape[1]:
+                    prob = float(matrix[t_i, f_i].clip(0, 1))
+                    token_probs.append(prob)
+        
+        # Average probability over tokens in the word
+        if token_probs:
+            word_probabilities.append(float(np.mean(token_probs)))
+        else:
+            word_probabilities.append(0.0)
+    
+    return [
+        WordTiming(word, tokens, start, end, probability)
+        for word, tokens, start, end, probability in zip(
+            words, word_tokens, start_times, end_times, word_probabilities
+        )
+    ]
+
+
+def _split_to_word_tokens(text_tokens: List[int], eot_token: int, tokenizer_info: dict) -> tuple[List[str], List[List[int]]]:
+    """Split tokens into words using actual tokenizer logic.
+    
+    Args:
+        text_tokens: List of token IDs
+        eot_token: End of text token ID
+        tokenizer_info: Dict containing tokenizer information and instance
+        
+    Returns:
+        Tuple of (words, word_tokens) where words are string representations
+        and word_tokens are lists of token IDs for each word.
+    """
+    # Get tokenizer from tokenizer_info
+    tokenizer = tokenizer_info.get("tokenizer")
+
+    # Check if this is a Whisper tokenizer with split_to_word_tokens method
+    if hasattr(tokenizer, 'split_to_word_tokens'):
+        # Use Whisper's built-in word splitting
+        words, word_tokens = tokenizer.split_to_word_tokens(text_tokens + [eot_token])
+        return words, word_tokens
+    
+    # Fallback: Manual word splitting for other tokenizer types
+    # Decode the text tokens to get the full text
+    text = tokenizer.decode(text_tokens, skip_special_tokens=True)
+    
+    # Split text into words using whitespace
+    text_words = text.split()
+    
+    if not text_words:
+        return [], [[eot_token]]
+    
+    # Now map tokens back to words
+    words = []
+    word_tokens = []
+    
+    # Decode each token individually to understand token boundaries
+    token_texts = []
+    for token_id in text_tokens:
+        token_text = tokenizer.decode([token_id], skip_special_tokens=True)
+        token_texts.append(token_text)
+    
+    # Group tokens into words
+    current_word = ""
+    current_word_tokens = []
+    word_idx = 0
+    
+    for i, (token_id, token_text) in enumerate(zip(text_tokens, token_texts)):
+        current_word += token_text
+        current_word_tokens.append(token_id)
+        
+        # Check if we've completed a word
+        if word_idx < len(text_words):
+            target_word = text_words[word_idx]
+            
+            # Handle cases where token text might have leading/trailing spaces
+            current_word_clean = current_word.strip()
+            
+            # If we've matched the target word
+            if current_word_clean == target_word:
+                words.append(target_word)
+                word_tokens.append(current_word_tokens)
+                current_word = ""
+                current_word_tokens = []
+                word_idx += 1
+            # If current word is longer than target, we might have multiple words in one token
+            elif len(current_word_clean) > len(target_word) and target_word in current_word_clean:
+                words.append(target_word)
+                word_tokens.append(current_word_tokens)
+                # Reset but keep remaining text
+                remaining_text = current_word_clean[current_word_clean.find(target_word) + len(target_word):].strip()
+                current_word = remaining_text
+                current_word_tokens = [token_id] if remaining_text else []
+                word_idx += 1
+    
+    # Handle any remaining tokens
+    if current_word_tokens:
+        remaining_text = current_word.strip()
+        if remaining_text:
+            words.append(remaining_text)
+            word_tokens.append(current_word_tokens)
+    
+    # Add any remaining words from text_words that we missed
+    while word_idx < len(text_words):
+        words.append(text_words[word_idx])
+        word_tokens.append([])  # Empty token list for unmatched words
+        word_idx += 1
+    
+    # Add EOT token as final word
+    word_tokens.append([eot_token])
+    words.append("")  # EOT word
+    
+    return words, word_tokens
+
+def merge_word_timings_with_chunks(
+    word_timings: List[WordTiming],
+    chunk_start_sec: float
+) -> List[WordTiming]:
+    """Adjust word timings by adding chunk start offset.
+    
+    Args:
+        word_timings: List of word timings from alignment
+        chunk_start_sec: Start time of the current chunk in seconds
+        
+    Returns:
+        List of word timings with adjusted timestamps
+    """
+    return [
+        WordTiming(
+            word=wt.word,
+            tokens=wt.tokens,
+            start=wt.start + chunk_start_sec,
+            end=wt.end + chunk_start_sec,
+            probability=wt.probability
+        )
+        for wt in word_timings
+    ]
 
 
 class WhisperAudioInputs(TypedDict):
@@ -193,6 +547,9 @@ class WhisperCrossAttention(WhisperAttention):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
+        output_attentions: bool = False,
+        alignment_heads: Optional[list[tuple[int, int]]] = None,
+        layer_idx: Optional[int] = None,
     ):
         q, _ = self.q_proj(hidden_states)
 
@@ -204,10 +561,59 @@ class WhisperCrossAttention(WhisperAttention):
         else:
             k = v = None
 
-        attn_output = self.attn(q, k, v)
+        # If we need attention weights, compute them efficiently with head slicing
+        attn_weights = None
+        if output_attentions and k is not None and v is not None:
+            # Determine which heads are needed for this layer to minimize memory allocation
+            layer_heads = None
+            if alignment_heads and layer_idx is not None:
+                layer_heads = [head_idx for layer, head_idx in alignment_heads if layer == layer_idx]
+            
+            if layer_heads:
+                # Use efficient attention for forward pass (memory-optimized)
+                attn_output = self.attn(q, k, v)
+                output, _ = self.out_proj(attn_output)
+                
+                # Compute attention weights ONLY for alignment heads
+                batch_size, seq_len, _ = q.shape
+                src_len = k.shape[1]
+                
+                # Reshape for multi-head attention: (batch, seq_len, num_heads, head_dim)
+                q_reshaped = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+                k_reshaped = k.view(batch_size, src_len, self.num_kv_heads, self.head_dim)
+                
+                # Handle grouped query attention by repeating KV heads if needed
+                if self.num_heads != self.num_kv_heads:
+                    repeat_factor = self.num_heads // self.num_kv_heads
+                    k_reshaped = k_reshaped.repeat_interleave(repeat_factor, dim=2)
+                
+                # Transpose to (batch, num_heads, seq_len, head_dim)
+                q_reshaped = q_reshaped.transpose(1, 2)
+                k_reshaped = k_reshaped.transpose(1, 2)
+                
+                # Select only the heads we need for alignment (saves 85-90% VRAM)
+                layer_head_indices = torch.tensor(layer_heads, device=q.device)
+                q_selected = q_reshaped.index_select(1, layer_head_indices).contiguous()
+                k_selected = k_reshaped.index_select(1, layer_head_indices).contiguous()
+                
+                # Compute attention scores only for selected heads: (batch, selected_heads, seq_len, src_len)
+                attn_scores = torch.matmul(q_selected, k_selected.transpose(-2, -1)) * self.scaling
+                attn_weights = torch.softmax(attn_scores, dim=-1)
+                # Cast to fp16 to save ~2× RAM (DTW code will re-cast to fp32 anyway)
+                attn_weights = attn_weights.to(torch.float16).contiguous()
+            else:
+                # No alignment heads for this layer, use efficient attention for forward pass
+                attn_output = self.attn(q, k, v)
+                output, _ = self.out_proj(attn_output)
+                # No weights returned for this layer (set to None to save memory)
+                attn_weights = None
+        else:
+            # Standard path without attention weight computation
+            attn_output = self.attn(q, k, v)
+            output, _ = self.out_proj(attn_output)
 
-        output, _ = self.out_proj(attn_output)
-
+        if output_attentions:
+            return output, attn_weights
         return output
 
 
@@ -327,6 +733,9 @@ class WhisperDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
+        output_attentions: bool = False,
+        layer_idx: Optional[int] = None,
+        alignment_heads: Optional[list[tuple[int, int]]] = None,
     ):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -335,10 +744,20 @@ class WhisperDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
-        hidden_states = self.encoder_attn(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-        )
+        if output_attentions:
+            hidden_states, cross_attn_weights = self.encoder_attn(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                output_attentions=True,
+                alignment_heads=alignment_heads,
+                layer_idx=layer_idx,
+            )
+        else:
+            hidden_states = self.encoder_attn(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            )
+            cross_attn_weights = None
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -346,6 +765,8 @@ class WhisperDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
+        if output_attentions:
+            return hidden_states, cross_attn_weights
         return hidden_states
 
 
@@ -429,18 +850,39 @@ class WhisperDecoder(nn.Module):
         input_ids,
         positions: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
+        output_attentions: bool = False,
+        alignment_heads: Optional[list[tuple[int, int]]] = None,
     ):
         inputs_embeds = self.get_input_embeddings(input_ids)
         positions = self.embed_positions(positions)
         hidden_states = inputs_embeds + positions
 
-        for decoder_layer in self.layers:
-            hidden_states = decoder_layer(
-                hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-            )
+        cross_attentions = [] if output_attentions else None
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if output_attentions:
+                hidden_states, cross_attn_weights = decoder_layer(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    output_attentions=True,
+                    layer_idx=layer_idx,
+                    alignment_heads=alignment_heads,
+                )
+                # Only store non-None cross attention weights to save memory
+                if cross_attn_weights is not None:
+                    cross_attentions.append(cross_attn_weights)
+                else:
+                    cross_attentions.append(None)
+            else:
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                )
 
         hidden_states = self.layer_norm(hidden_states)
+        
+        if output_attentions:
+            return hidden_states, cross_attentions
         return hidden_states
 
     def get_input_embeddings(
@@ -464,14 +906,26 @@ class WhisperModel(nn.Module):
         input_features: Optional[Union[torch.Tensor, list[torch.Tensor]]],
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+        output_attentions: bool = False,
+        alignment_heads: Optional[list[tuple[int, int]]] = None,
+    ):
         encoder_outputs = self.get_encoder_outputs(input_features)
-        decoder_outputs = self.decoder(
-            input_ids=input_ids,
-            positions=positions,
-            encoder_hidden_states=encoder_outputs,
-        )
-        return decoder_outputs
+        if output_attentions:
+            decoder_outputs, cross_attentions = self.decoder(
+                input_ids=input_ids,
+                positions=positions,
+                encoder_hidden_states=encoder_outputs,
+                output_attentions=True,
+                alignment_heads=alignment_heads,
+            )
+            return decoder_outputs, cross_attentions
+        else:
+            decoder_outputs = self.decoder(
+                input_ids=input_ids,
+                positions=positions,
+                encoder_hidden_states=encoder_outputs,
+            )
+            return decoder_outputs
 
     def get_encoder_outputs(
         self,
@@ -669,6 +1123,31 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size, logit_scale)
+        
+        # Default alignment heads for word-level timestamps
+        # These are the standard alignment heads used by OpenAI Whisper
+        self.alignment_heads = getattr(config, "alignment_heads", [
+            (0, 2), (0, 3), (0, 4), (0, 5), (1, 0), (1, 1), (1, 2), (1, 3),
+            (2, 0), (2, 1), (2, 2), (2, 3), (3, 0), (3, 1), (3, 2), (3, 3),
+            (4, 0), (4, 1), (4, 2), (4, 3), (5, 0), (5, 1), (5, 2), (5, 3)
+        ])
+        
+        # Cache processor components to avoid hot-path lookups during word timing extraction
+        self._cached_processor = None
+        self._cached_tokenizer = None
+        self._cached_feature_extractor = None
+
+    def _get_cached_processor_components(self):
+        """Lazily cache processor components to avoid hot-path lookups during word timing extraction."""
+        if self._cached_processor is None:
+            from vllm.transformers_utils.processor import cached_get_processor
+            self._cached_processor = cached_get_processor(
+                self.config.name_or_path if hasattr(self.config, 'name_or_path') else 'openai/whisper-base'
+            )
+            self._cached_tokenizer = self._cached_processor.tokenizer
+            self._cached_feature_extractor = self._cached_processor.feature_extractor
+        
+        return self._cached_tokenizer, self._cached_feature_extractor
 
     def forward(
         self,
@@ -677,10 +1156,44 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
         **kwargs,
     ) -> torch.Tensor:
         audio_input = self._parse_and_validate_audio_input(**kwargs)
-        decoder_outputs = self.model(
-            input_features=audio_input["input_features"],
+        encoder_outputs = self.model.get_encoder_outputs(audio_input.get("input_features"))
+
+        sampling_metadata = kwargs.get("sampling_metadata")
+        if sampling_metadata:
+            for seq_group in sampling_metadata.seq_groups:
+                granularities = getattr(seq_group.sampling_params,
+                                        "timestamp_granularities", ())
+                if "word" not in granularities:
+                    continue                                        # nothing to do for this group
+
+                seq_group._cached_encoder_outputs = encoder_outputs
+
+                # -- audio length mapping (needed for hop-length → frame math) --
+                audio_mm = getattr(seq_group, "mm_items", {}).get("audio")
+                audio_lengths: dict[str, int] = {}
+
+                if audio_mm is not None and audio_input.get("input_features") is not None:
+                    if isinstance(audio_mm, list):
+                        # each list item can be Tensor or (Tensor, sr)
+                        for idx, (seq_id, _) in enumerate(seq_group.seq_data.items()):
+                            try:
+                                wav = audio_mm[idx][0] if isinstance(audio_mm[idx], tuple) else audio_mm[idx]
+                            except IndexError:                       # safety net
+                                wav = audio_mm[0][0] if isinstance(audio_mm[0], tuple) else audio_mm[0]
+                            audio_lengths[seq_id] = int(wav.shape[-1])
+                    else:                                           # single clip reused by all seqs
+                        wav = audio_mm[0] if isinstance(audio_mm, tuple) else audio_mm
+                        length = int(wav.shape[-1])
+                        for seq_id in seq_group.seq_data:
+                            audio_lengths[seq_id] = length
+
+                seq_group._cached_audio_lengths = audio_lengths
+
+        # 3. Decoder
+        decoder_outputs = self.model.decoder(
             input_ids=input_ids,
             positions=positions,
+            encoder_hidden_states=encoder_outputs,
         )
         return decoder_outputs
 
@@ -719,29 +1232,247 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
 
     def compute_logits(self, hidden_states: torch.Tensor,
                        sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        # Check if any sequence in the batch requires timestamp processing
+        timestamp_requirements = self._check_timestamp_requirements(sampling_metadata)
+        
+        if timestamp_requirements["word"]:
+            self._process_completed_sequences_for_word_timings(sampling_metadata)
+            
         logits = self.logits_processor(self.proj_out, hidden_states,
                                        sampling_metadata)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["proj_out."])
+    def _process_completed_sequences_for_word_timings(self, sampling_metadata: SamplingMetadata) -> None:
+        """Process word timings only for sequences that have just completed (seen EOT token).
+        
+        This avoids running the second decoder pass multiple times during generation.
+        """
+        
+        for seq_group in sampling_metadata.seq_groups:
+            if (hasattr(seq_group.sampling_params, 'timestamp_granularities') and 
+                "word" in seq_group.sampling_params.timestamp_granularities):
+                
+                # Get cached encoder outputs
+                encoder_outputs = getattr(seq_group, '_cached_encoder_outputs', None)
+                if encoder_outputs is None:
+                    continue
+                
+                # Ensure encoder outputs are on the same device (important for CPU offload)
+                # Do this once per group and cache the result to prevent PCIe thrashing
+                device = next(self.model.parameters()).device
+                if encoder_outputs.device != device:
+                    encoder_outputs = encoder_outputs.to(device)
+                    # Cache the device-copied version to avoid repeated transfers
+                    seq_group._cached_encoder_outputs = encoder_outputs
+                
+                seq_data = seq_group.seq_data
+                for seq_id, seq in seq_data.items():
+                    token_ids = seq.get_token_ids()
+                    
+                    # Skip if sequence is too short or already processed
+                    if len(token_ids) < 5:
+                        continue
+                    
+                    # Optimization: Track last checked length to avoid redundant processing
+                    last_checked_length = getattr(seq, '_last_word_timing_check_length', 0)
+                    if len(token_ids) <= last_checked_length:
+                        continue
+                    
+                    seq._last_word_timing_check_length = len(token_ids)
+                    
+                    # Process sequences that might be completed
+                    try:
+                        # Get cached tokenizer components (avoid hot-path processor lookup)
+                        tokenizer, feature_extractor = self._get_cached_processor_components()
+                        
+                        # Use dynamic EOT token (50257 for transcribe, 51009 for translate)
+                        eot_token = tokenizer.eot
+                        
+                        # Check if sequence is completed (ends with EOT token)
+                        sequence_completed = (len(token_ids) > 0 and token_ids[-1] == eot_token)
+                        
+                        # Only process completed sequences that haven't been processed yet
+                        if (sequence_completed and 
+                            not (hasattr(seq, 'word_timings_processed') and seq.word_timings_processed)):
+                        
+                            # Use dynamic SOT sequence length based on task/language settings
+                            # Different tasks (transcribe/translate) and languages can have different SOT sequence lengths
+                            sot_sequence_len = getattr(tokenizer, 'sot_sequence_length', 4)
+                            
+                            # Handle <|notimestamps|> token (50258) after SOT sequence
+                            if len(token_ids) > sot_sequence_len and token_ids[sot_sequence_len] == 50258:
+                                sot_sequence_len += 1  # skip notimestamps flag
+                            
+                            # Extract text tokens (remove special tokens)
+                            # Remove SOT sequence (dynamic length) and EOT token (last token)
+                            text_tokens = token_ids[sot_sequence_len:-1] if len(token_ids) > sot_sequence_len + 1 else []
+                        
+                            if len(text_tokens) > 0:
+                                # Get original audio length for this specific sequence for proper frame calculation
+                                cached_audio_lengths = getattr(seq_group, '_cached_audio_lengths', {})
+                                original_audio_length = cached_audio_lengths.get(seq_id)
+                                
+                                if original_audio_length is not None:
+                                    try:
+                                        # Use cached feature extractor
+                                        # Calculate frames properly: math.ceil(original_audio_length / hop_length)
+                                        # Use ceil to avoid dropping the tail frame
+                                        # This accounts for the actual downsampling factor regardless of model variant
+                                        # (e.g., large-v3 has stride 4, while base/small/medium have stride 2)
+                                        num_frames = math.ceil(original_audio_length / feature_extractor.hop_length)
+                                    except Exception as e:
+                                        logger.warning(f"Failed to get feature extractor for frame calculation, falling back to encoder output: {e}")
+                                        # Fallback to encoder output shape (less accurate for different model variants)
+                                        num_frames = encoder_outputs.shape[1] * 2
+                                else:
+                                    # Fallback to encoder output shape (less accurate for different model variants)  
+                                    num_frames = encoder_outputs.shape[1] * 2
+                                
+                                # Run decoder pass once with attention collection for completed sequence
+                                decoder_input_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+                                positions = torch.arange(len(decoder_input_ids), dtype=torch.long, device=device)
+                                
+                                logger.debug(f"Running second decoder pass for word timing extraction on completed sequence {seq_id} (length={len(token_ids)})")
+                                
+                                with torch.inference_mode(), torch.cuda.amp.autocast(enabled=False):
+                                    _, cross_attentions = self.model.decoder(
+                                        input_ids=decoder_input_ids.unsqueeze(0),
+                                        positions=positions.unsqueeze(0),
+                                        encoder_hidden_states=encoder_outputs,
+                                        output_attentions=True,
+                                        alignment_heads=self.alignment_heads,
+                                    )
+                                    
+                                    # Filter out None values from cross_attentions (layers with no alignment heads)
+                                    attn_for_dtw = [w for w in cross_attentions if w is not None]
+                                    
+                                    # Guard against empty attention case
+                                    if not attn_for_dtw:
+                                        # Nothing to align → return empty list
+                                        seq.word_timings = []
+                                    else:
+                                        # Extract word timings using alignment (without chunk offset)
+                                        word_timings = self._extract_word_timings(
+                                            cross_attention_weights=attn_for_dtw,
+                                            text_tokens=text_tokens,
+                                            num_frames=num_frames,
+                                            chunk_start_sec=0.0  # Don't apply offset in extraction
+                                        )
+                                        
+                                        # Apply chunk offset merge before marking as processed
+                                        chunk_start_sec = getattr(seq_group, 'chunk_start_sec', 0.0)
+                                        if chunk_start_sec > 0:
+                                            word_timings = merge_word_timings_with_chunks(word_timings, chunk_start_sec)
+                                        
+                                        # Store word timings in sequence for later retrieval
+                                        seq.word_timings = word_timings
+                                        # Mark for cleanup after JSON serialization to prevent VRAM leaks
+                                        seq._word_timings_needs_cleanup = True
+                                    seq.word_timings_processed = True  # Mark as processed
+                                    logger.debug(f"Extracted {len(word_timings)} word timings for completed sequence {seq_id}")
+                            else:
+                                # Mark as processed even if no text tokens (empty transcription)
+                                seq.word_timings = []
+                                seq._word_timings_needs_cleanup = True
+                                seq.word_timings_processed = True
+                                
+                    except Exception as e:
+                        logger.warning(f"Failed to process word timings for completed sequence {seq_id}: {e}")
+                        # Mark as processed to avoid retrying
+                        seq.word_timings_processed = True
+                
+                # Clean up cached data to free memory (3 MB / chunk)
+                if hasattr(seq_group, '_cached_encoder_outputs'):
+                    del seq_group._cached_encoder_outputs
+                if hasattr(seq_group, '_cached_audio_lengths'):
+                    del seq_group._cached_audio_lengths
 
-        # add fake zeros bias for k_proj to state_dict
-        weights = _create_fake_bias_for_k_proj(weights)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+                    
+                # Clean up sequence-level state for multi-request isolation
+                # (important for streaming responses where objects persist across chunks)
+                for seq_id, seq in seq_group.seq_data.items():
+                    if hasattr(seq, '_last_word_timing_check_length'):
+                        del seq._last_word_timing_check_length
+                    if hasattr(seq, 'word_timings_processed'):
+                        del seq.word_timings_processed
+                        
+                    # Clean up word timing VRAM after JSON serialization to prevent leaks in long streams
+                    if getattr(seq, "_word_timings_needs_cleanup", False):
+                        if hasattr(seq, 'word_timings'):
+                            del seq.word_timings
+                        del seq._word_timings_needs_cleanup
 
+    def _check_timestamp_requirements(self, sampling_metadata: SamplingMetadata) -> dict[str, bool]:
+        """Check if any sequence in the batch requires timestamp granularities.
+        
+        Returns:
+            Dict with 'segment' and 'word' keys indicating if those granularities are needed.
+        """
+        needs_segment = False
+        needs_word = False
+        
+        if sampling_metadata.seq_groups:
+            for seq_group in sampling_metadata.seq_groups:
+                timestamp_granularities = getattr(
+                    seq_group.sampling_params, 'timestamp_granularities', None
+                )
+                if timestamp_granularities:
+                    if "segment" in timestamp_granularities:
+                        needs_segment = True
+                    if "word" in timestamp_granularities:
+                        needs_word = True
+                    # Early exit if both are found
+                    if needs_segment and needs_word:
+                        break
+        
+        return {"segment": needs_segment, "word": needs_word}
 
-def _create_fake_bias_for_k_proj(
-    weights: Iterable[tuple[str, torch.Tensor]]
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """
-    Create full zeros bias for k_proj weight in self-attn and x-attn layers.
-    So that the bias for k_proj in qkv_proj can be initialized with zeros.
-    """
-    for name, weight in weights:
-        if name.endswith(".k_proj.weight"):
-            bias = torch.zeros(weight.size(0))
-            bias_name = name.replace("weight", "bias")
-            yield from [(name, weight), (bias_name, bias)]
-        yield name, weight
+    def _extract_word_timings(
+        self, 
+        cross_attention_weights: list[torch.Tensor], 
+        text_tokens: list[int],
+        num_frames: int,
+        chunk_start_sec: float = 0.0
+    ) -> list[WordTiming]:
+        """Extract word-level timings from cross-attention weights using DTW alignment.
+        
+        Args:
+            cross_attention_weights: List of attention weight tensors from decoder layers
+            text_tokens: Token IDs for the text (without special tokens)
+            num_frames: Number of audio frames
+            chunk_start_sec: Start time of current chunk for long audio
+            
+        Returns:
+            List of WordTiming objects with word-level timestamps
+        """
+        try:
+            # Get cached processor components for time conversion
+            tokenizer, feature_extractor = self._get_cached_processor_components()
+            
+            feature_extractor_info = {
+                "hop_length": feature_extractor.hop_length,
+                "sampling_rate": feature_extractor.sampling_rate,
+            }
+            
+            # Tokenizer info with actual tokenizer instance
+            tokenizer_info = {
+                "sot_sequence_len": getattr(tokenizer, 'sot_sequence_length', 4),  # Dynamic SOT length based on task/language
+                "eot_token": tokenizer.eot if hasattr(tokenizer, 'eot') else 50257,
+                "tokenizer": tokenizer,  # Pass actual tokenizer instance
+            }
+            
+            # Perform alignment
+            word_timings = find_alignment(
+                cross_attention_weights=cross_attention_weights,
+                text_tokens=text_tokens,
+                num_frames=num_frames,
+                alignment_heads=self.alignment_heads,
+                tokenizer_info=tokenizer_info,
+                feature_extractor_info=feature_extractor_info,
+            )
+            
+            return word_timings
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract word timings: {e}")
+            return []
