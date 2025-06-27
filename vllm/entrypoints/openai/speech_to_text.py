@@ -28,7 +28,7 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils import PlaceholderModule
-from vllm.model_executor.whisper_alignment import WordTiming
+from vllm.model_executor.models.whisper import WordTiming
 
 try:
     import librosa
